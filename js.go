@@ -570,7 +570,12 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 	// Check if we are manual ack.
 	if cb != nil && !o.mack {
 		ocb := cb
-		cb = func(m *Msg) { ocb(m); m.Ack() }
+		cb = func(m *Msg) {
+			m.Sub.jsi.autoAck = true
+			ocb(m)
+			m.Sub.jsi.autoAck = false
+			m.Ack()
+		}
 	}
 
 	sub, err = js.nc.subscribe(deliver, queue, cb, ch, cb == nil, &jsSub{js: js})
@@ -863,31 +868,36 @@ func (js *js) getConsumerInfo(stream, consumer string) (*ConsumerInfo, error) {
 	return info.ConsumerInfo, nil
 }
 
-func (m *Msg) checkReply() (*js, bool, error) {
+func (m *Msg) checkReply() (*js, bool, bool, error) {
 	if m.Reply == "" {
-		return nil, false, ErrMsgNoReply
+		return nil, false, false, ErrMsgNoReply
 	}
 	if m == nil || m.Sub == nil {
-		return nil, false, ErrMsgNotBound
+		return nil, false, false, ErrMsgNotBound
 	}
 	sub := m.Sub
 	sub.mu.Lock()
 	if sub.jsi == nil {
 		sub.mu.Unlock()
-		return nil, false, ErrNotJSMessage
+		return nil, false, false, ErrNotJSMessage
 	}
 	js := sub.jsi.js
 	isPullMode := sub.jsi.pull > 0
+	autoAck := sub.jsi.autoAck
 	sub.mu.Unlock()
 
-	return js, isPullMode, nil
+	return js, isPullMode, autoAck, nil
 }
 
 // ackReply handles all acks. Will do the right thing for pull and sync mode.
 func (m *Msg) ackReply(ackType []byte, sync bool) error {
-	js, isPullMode, err := m.checkReply()
+	js, isPullMode, autoAck, err := m.checkReply()
 	if err != nil {
 		return err
+	}
+	// Cannot ack while autoAck is enabled.
+	if autoAck {
+		return ErrInvalidJSAck
 	}
 	if isPullMode {
 		if bytes.Equal(ackType, AckAck) {
@@ -928,12 +938,13 @@ func (m *Msg) Term() error {
 	return m.ackReply(AckTerm, false)
 }
 
-// Indicate that this message is being worked on and reset redelkivery timer in the server.
+// InProgress indicates that this message is being worked on
+// and reset the redelivery timer in the server.
 func (m *Msg) InProgress() error {
 	return m.ackReply(AckProgress, false)
 }
 
-// JetStream metadata associated with received messages.
+// MsgMetaData is metadata associated with received messages.
 type MsgMetaData struct {
 	Consumer  uint64
 	Stream    uint64
@@ -942,8 +953,9 @@ type MsgMetaData struct {
 	Timestamp time.Time
 }
 
+// MetaData returns the metadata from a JetStream message.
 func (m *Msg) MetaData() (*MsgMetaData, error) {
-	if _, _, err := m.checkReply(); err != nil {
+	if _, _, _, err := m.checkReply(); err != nil {
 		return nil, err
 	}
 
